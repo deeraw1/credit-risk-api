@@ -17,6 +17,7 @@ import joblib
 from pathlib import Path
 
 from sklearn.pipeline           import Pipeline
+from sklearn.base               import clone
 from sklearn.compose            import ColumnTransformer
 from sklearn.preprocessing      import OneHotEncoder, StandardScaler
 from sklearn.model_selection    import StratifiedKFold, cross_val_score, train_test_split
@@ -61,7 +62,7 @@ CAT_CATEGORIES = [
 
 # ── Load & engineer features ──────────────────────────────────────────────────
 def load_data(path: Path) -> pd.DataFrame:
-    print(f"Loading data from {path} …")
+    print(f"Loading data from {path}...")
     df = pd.read_csv(path)
     df = df.drop(columns=["LoanID"], errors="ignore")
 
@@ -163,9 +164,9 @@ def evaluate(name, y_true, y_prob, threshold):
         np.cumsum(np.bincount(y_true[y_pred == 0], minlength=2) / (y_true == 0).sum())
     )) if len(np.unique(y_pred)) > 1 else 0.0
 
-    print(f"\n{'─'*50}")
+    print(f"\n{'-'*50}")
     print(f"  {name}")
-    print(f"{'─'*50}")
+    print(f"{'-'*50}")
     print(f"  AUC-ROC       : {auc:.4f}")
     print(f"  AUC-PR        : {ap:.4f}")
     print(f"  Brier Score   : {brier:.4f}  (lower=better)")
@@ -186,140 +187,64 @@ def main():
     )
     print(f"\nTrain: {len(X_train):,}  |  Test: {len(X_test):,}")
 
-    preprocessor = build_preprocessor()
+    model_name = "LightGBM"
+    best_params = {
+        "n_estimators":      800,
+        "max_depth":         6,
+        "learning_rate":     0.05,
+        "num_leaves":        63,
+        "subsample":         0.8,
+        "colsample_bytree":  0.8,
+        "min_child_samples": 30,
+        "reg_alpha":         0.1,
+        "reg_lambda":        1.0,
+        "is_unbalance":      True,
+        "random_state":      42,
+        "n_jobs":            -1,
+        "verbose":           -1,
+    }
 
-    # ── Tune XGBoost ──────────────────────────────────────────────────────────
-    print("\n[1/4] Tuning XGBoost (50 trials) …")
-    xgb_study = optuna.create_study(direction="maximize")
-    xgb_study.optimize(
-        lambda t: xgb_objective(t, X_train, y_train, build_preprocessor()),
-        n_trials=50, show_progress_bar=True
-    )
-    xgb_best_auc = xgb_study.best_value
-    print(f"  XGBoost best CV AUC: {xgb_best_auc:.4f}")
-
-    # ── Tune LightGBM ─────────────────────────────────────────────────────────
-    print("\n[2/4] Tuning LightGBM (50 trials) …")
-    lgb_study = optuna.create_study(direction="maximize")
-    lgb_study.optimize(
-        lambda t: lgb_objective(t, X_train, y_train, build_preprocessor()),
-        n_trials=50, show_progress_bar=True
-    )
-    lgb_best_auc = lgb_study.best_value
-    print(f"  LightGBM best CV AUC: {lgb_best_auc:.4f}")
-
-    # ── Select winner ─────────────────────────────────────────────────────────
-    print(f"\n[3/4] Selecting best model …")
-    if xgb_best_auc >= lgb_best_auc:
-        print(f"  Winner: XGBoost (AUC {xgb_best_auc:.4f})")
-        best_params = xgb_study.best_params
-        best_params["scale_pos_weight"] = (y_train == 0).sum() / (y_train == 1).sum()
-        best_params["eval_metric"]      = "auc"
-        best_params["use_label_encoder"]= False
-        best_params["random_state"]     = 42
-        best_params["n_jobs"]           = -1
-        base_clf = xgb.XGBClassifier(**best_params)
-        model_name = "XGBoost"
-    else:
-        print(f"  Winner: LightGBM (AUC {lgb_best_auc:.4f})")
-        best_params = lgb_study.best_params
-        best_params["is_unbalance"] = True
-        best_params["random_state"] = 42
-        best_params["n_jobs"]       = -1
-        best_params["verbose"]      = -1
-        base_clf   = lgb.LGBMClassifier(**best_params)
-        model_name = "LightGBM"
-
-    # ── Train final pipeline + calibrate ─────────────────────────────────────
-    print(f"\n[4/4] Training final pipeline + isotonic calibration …")
-    pre  = build_preprocessor()
-    pre.fit(X_train, y_train)
-    X_train_t = pre.transform(X_train)
-    X_test_t  = pre.transform(X_test)
-
-    base_clf.fit(X_train_t, y_train)
-
-    # Calibrate on a holdout split of train set
-    X_cal_base, X_cal_hold, y_cal_base, y_cal_hold = train_test_split(
-        X_train_t, y_train, test_size=0.2, stratify=y_train, random_state=99
-    )
-    base_clf.fit(X_cal_base, y_cal_base)
-    calibrated = CalibratedClassifierCV(base_clf, cv="prefit", method="isotonic")
-    calibrated.fit(X_cal_hold, y_cal_hold)
-
-    # Retrain base on full train, then wrap calibrated
-    base_clf.fit(X_train_t, y_train)
-    calibrated_final = CalibratedClassifierCV(base_clf, cv="prefit", method="isotonic")
-    calibrated_final.fit(X_train_t, y_train)
-
-    # Evaluate uncalibrated vs calibrated on test
-    y_prob_raw = base_clf.predict_proba(X_test_t)[:, 1]
-    y_prob_cal = calibrated_final.predict_proba(X_test_t)[:, 1]
-
-    thr_raw = optimal_threshold(y_test, y_prob_raw)
-    thr_cal = optimal_threshold(y_test, y_prob_cal)
-
-    print("\n── Uncalibrated ──")
-    metrics_raw = evaluate("Uncalibrated " + model_name, y_test.values, y_prob_raw, thr_raw)
-    print("\n── Calibrated (isotonic) ──")
-    metrics_cal = evaluate("Calibrated " + model_name, y_test.values, y_prob_cal, thr_cal)
-
-    # Calibration curve check
-    frac_pos, mean_pred = calibration_curve(y_test, y_prob_cal, n_bins=10)
-    cal_error = float(np.mean(np.abs(frac_pos - mean_pred)))
-    print(f"\n  Calibration error (mean abs): {cal_error:.4f}  (lower=better, <0.02 is excellent)")
-
-    # ── Build final production pipeline ───────────────────────────────────────
-    # Wrap preprocessor + calibrated model into a single clean Pipeline
-    # We store pre + calibrated separately so Pipeline.predict_proba works cleanly
+    print(f"\n[1/2] Training LightGBM pipeline...")
     production_pipeline = Pipeline([
-        ("preprocessor",  build_preprocessor()),
-        ("model",         CalibratedClassifierCV(
-            xgb.XGBClassifier(**{**best_params}) if model_name == "XGBoost"
-            else lgb.LGBMClassifier(**{**best_params}),
-            cv=5, method="isotonic"
-        )),
+        ("preprocessor", build_preprocessor()),
+        ("model",        lgb.LGBMClassifier(**best_params)),
     ])
     production_pipeline.fit(X_train, y_train)
 
-    # Verify on test
     y_final_prob = production_pipeline.predict_proba(X_test)[:, 1]
     final_auc    = roc_auc_score(y_test, y_final_prob)
     final_thr    = optimal_threshold(y_test, y_final_prob)
-    print(f"\n  Final production pipeline AUC: {final_auc:.4f}  |  Threshold: {final_thr:.4f}")
+
+    print(f"\n[2/2] Evaluating...")
+    metrics = evaluate(model_name, y_test.values, y_final_prob, final_thr)
+    print(f"\n  AUC: {final_auc:.4f}  |  Threshold: {final_thr:.4f}")
 
     # ── Save bundle ───────────────────────────────────────────────────────────
     bundle = {
-        "pipeline":          production_pipeline,
-        "threshold":         round(final_thr, 4),
-        "model_name":        model_name,
-        "features":          ALL_FEATURES,
-        "numeric_features":  NUMERIC_FEATURES,
-        "categorical_features": CATEGORICAL_FEATURES,
-        "binary_features":   BINARY_FEATURES,
-        "cat_categories":    CAT_CATEGORIES,
-        "metrics": {
-            "auc_roc":         round(final_auc, 4),
-            "calibration_error": round(cal_error, 4),
-            **metrics_cal,
-        },
+        "pipeline":              production_pipeline,
+        "threshold":             round(final_thr, 4),
+        "model_name":            model_name,
+        "features":              ALL_FEATURES,
+        "numeric_features":      NUMERIC_FEATURES,
+        "categorical_features":  CATEGORICAL_FEATURES,
+        "binary_features":       BINARY_FEATURES,
+        "cat_categories":        CAT_CATEGORIES,
+        "metrics":               metrics,
     }
     joblib.dump(bundle, MODEL_OUT, compress=3)
-    print(f"\n  Model saved → {MODEL_OUT}  ({MODEL_OUT.stat().st_size / 1e6:.1f} MB)")
+    print(f"\n  Model saved: {MODEL_OUT}  ({MODEL_OUT.stat().st_size / 1e6:.1f} MB)")
 
-    # Training report
     report = {
-        "model": model_name,
+        "model":         model_name,
         "training_rows": len(X_train),
         "test_rows":     len(X_test),
         "default_rate":  round(float(y.mean()), 4),
         "threshold":     round(final_thr, 4),
-        "best_params":   {k: (v if not isinstance(v, float) else round(v, 6))
-                          for k, v in best_params.items()},
-        "metrics":       bundle["metrics"],
+        "best_params":   best_params,
+        "metrics":       metrics,
     }
     REPORT_OUT.write_text(json.dumps(report, indent=2))
-    print(f"  Report saved → {REPORT_OUT}")
+    print(f"  Report saved: {REPORT_OUT}")
     print("\nDone.")
 
 

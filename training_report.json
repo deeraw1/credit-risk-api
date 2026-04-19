@@ -1,0 +1,28 @@
+{
+  "model": "LightGBM",
+  "training_rows": 204277,
+  "test_rows": 51070,
+  "default_rate": 0.1161,
+  "threshold": 0.454,
+  "best_params": {
+    "n_estimators": 800,
+    "max_depth": 6,
+    "learning_rate": 0.05,
+    "num_leaves": 63,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8,
+    "min_child_samples": 30,
+    "reg_alpha": 0.1,
+    "reg_lambda": 1.0,
+    "is_unbalance": true,
+    "random_state": 42,
+    "n_jobs": -1,
+    "verbose": -1
+  },
+  "metrics": {
+    "auc_roc": 0.7495,
+    "auc_pr": 0.3203,
+    "brier": 0.1805,
+    "threshold": 0.454
+  }
+}

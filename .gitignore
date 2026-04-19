@@ -3,3 +3,5 @@ __pycache__/
 .env
 venv/
 .venv/
+optimized_credit_model.pkl
+train_log.txt
