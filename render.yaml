@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: credit-risk-api
+    env: python
+    runtime: python311
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
